@@ -14,6 +14,7 @@ Options:
 
 import re
 import win32com.client
+from win32com.client import constants as vis  # kept for future use, not required for conn pts
 import pyperclip
 import argparse
 import sys
@@ -21,25 +22,27 @@ import os
 from collections import defaultdict, deque
 import math
 
-# Visio constants
-VIS_SECTION_CONNECTIONPTS = 7      # visSectionConnectionPts
-VIS_ROW_CONNECTIONPTS = 0          # visRowConnectionPts
-VIS_TAG_CNNCTPT = 153              # visTagCnnctPt
-VIS_CELL_X = 0                     # Column index for X
-VIS_CELL_Y = 1                     # Column index for Y
-
-# A4 dimensions in inches (Visio uses inches)
-A4_WIDTH = 8.27
-A4_HEIGHT = 11.69
+# A4 dimensions in inches (Visio uses inches) – LANDSCAPE
+A4_WIDTH = 11.69
+A4_HEIGHT = 8.27
 
 # Margins and shape sizing
 MARGIN = 0.5
 SHAPE_WIDTH = 1.5
 SHAPE_HEIGHT = 0.75
+HORIZONTAL_SPACING = 0.5
+VERTICAL_SPACING = 0.75
 
 # Connection point defaults
 DEFAULT_HORIZONTAL_CONNECTIONS = 5
 DEFAULT_VERTICAL_CONNECTIONS = 3
+
+# Visio Connection Points constants (numeric, to avoid typelib issues)
+VIS_SECTION_CONNECTIONPTS = 7      # visSectionConnectionPts
+VIS_ROW_CONNECTIONPTS = 0          # visRowConnectionPts
+VIS_TAG_CNNCTPT = 153              # visTagCnnctPt
+VIS_CELL_X = 0                     # Column index for X
+VIS_CELL_Y = 1                     # Column index for Y
 
 
 class MermaidParser:
@@ -47,27 +50,109 @@ class MermaidParser:
 
     def __init__(self, mermaid_text):
         self.text = mermaid_text
-        self.nodes = {}  # node_id -> label
-        self.edges = []  # list of (from_id, to_id)
+        self.nodes = {}          # node_id -> label
+        self.edges = []          # list of (from_id, to_id)
+        self.groups = {}         # node_id -> subgraph name
+
+    def _clean_label(self, label):
+        """Trim whitespace and strip a single pair of surrounding quotes."""
+        if label is None:
+            return None
+        s = label.strip()
+        if len(s) >= 2 and (
+            (s[0] == '"' and s[-1] == '"') or
+            (s[0] == "'" and s[-1] == "'")
+        ):
+            s = s[1:-1].strip()
+        return s
+
+    def _register_node(self, node_id, label, current_group=None):
+        """Set node label only if not already set (no overwrite)."""
+        if label is not None:
+            label = self._clean_label(label)
+        if label:
+            self.nodes.setdefault(node_id, label)
+        else:
+            self.nodes.setdefault(node_id, node_id)
+
+        if current_group is not None and node_id not in self.groups:
+            self.groups[node_id] = current_group
 
     def parse(self):
         """Extract nodes and edges from Mermaid syntax"""
         lines = self.text.strip().split('\n')
 
-        for line in lines:
-            line = line.strip()
+        in_front_matter = False
+        current_group = None
 
-            # Skip diagram type declarations, empty lines, and comments
-            if not line or line.startswith('graph') or line.startswith('flowchart') or line.startswith('%'):
+        for raw_line in lines:
+            line = raw_line.strip()
+
+            if not line:
                 continue
 
-            # Handle curly braces in node definitions (e.g., C{Authenticated?})
-            line = re.sub(r'(\w+)\{([^}]+)\}', r'\1[\2]', line)
+            # Handle YAML-style front-matter: ignore everything between --- markers
+            if line.startswith('---'):
+                in_front_matter = not in_front_matter
+                continue
+            if in_front_matter:
+                continue
 
-            # Handle different arrow types: -->, --->, -.->
+            # Skip diagram type declarations and comments
+            if line.startswith('graph') or line.startswith('flowchart') or line.startswith('%'):
+                continue
+
+            # Skip subgraph headers / footers and track current group
+            if line.startswith('subgraph '):
+                m = re.match(r'subgraph\s+([A-Za-z0-9_]+)', line)
+                if m:
+                    current_group = m.group(1)
+                else:
+                    current_group = None
+                continue
+
+            if line == 'end':
+                current_group = None
+                continue
+
+            # Skip styling / class definitions / class assignments
+            if line.startswith('classDef ') or line.startswith('class '):
+                continue
+            if ':::' in line:
+                # e.g. AD_PCN:::core
+                continue
+
+            # Remove Mermaid line comments (%% ...)
+            if '%%' in line:
+                line = line.split('%%', 1)[0].strip()
+                if not line:
+                    continue
+
+            # -------------- Normalisation of labelled edges --------------
+
+            # 1) "A -- some label --> B"  -> "A --> B"
+            line = re.sub(
+                r'(\w+(?:\[.*?\])?)\s--[^>]+-->',
+                r'\1 -->',
+                line
+            )
+
+            # 2) "A -. some label .-> B"  -> "A --> B"
+            line = re.sub(
+                r'(\w+(?:\[.*?\])?)\s-\.[^>]+\.->',
+                r'\1 -->',
+                line
+            )
+
+            # 3) Undirected/solid: "---" -> "-->"
+            line = line.replace('---', '-->')
+
+            # 4) Other arrow variants: -.->, -->, --->, etc. -> -->
             line = re.sub(r'[-\.]{2,}>', '-->', line)
 
-            # Parse connection with labels on edges: A -->|label| B
+            # -------------- Parse edges and nodes --------------
+
+            # 1) Edge with explicit label syntax: A -->|label| B or A --|label|--> B
             edge_label_match = re.search(
                 r'(\w+)(?:\[([^\]]+)\])?\s*-->\|([^\|]+)\|\s*(\w+)(?:\[([^\]]+)\])?',
                 line
@@ -75,24 +160,46 @@ class MermaidParser:
             if edge_label_match:
                 from_id = edge_label_match.group(1)
                 from_label = edge_label_match.group(2)
+                # edge_label = edge_label_match.group(3)  # ignored for layout
                 to_id = edge_label_match.group(4)
                 to_label = edge_label_match.group(5)
 
-                # Only set label if we have one and node doesn't exist yet
-                if from_label:
-                    self.nodes[from_id] = from_label
-                elif from_id not in self.nodes:
-                    self.nodes[from_id] = from_id
-
-                if to_label:
-                    self.nodes[to_id] = to_label
-                elif to_id not in self.nodes:
-                    self.nodes[to_id] = to_id
+                self._register_node(from_id, from_label, current_group)
+                self._register_node(to_id, to_label, current_group)
 
                 self.edges.append((from_id, to_id))
                 continue
 
-            # Parse standard connection: A --> B or A[Label] --> B[Label]
+            # 2) Multi-target edges, e.g. A --> B & C & D["Label"]
+            if '&' in line and '-->' in line:
+                multi_match = re.search(
+                    r'(\w+)(?:\[([^\]]+)\])?\s*-->\s*(.+)',
+                    line
+                )
+                if multi_match:
+                    from_id = multi_match.group(1)
+                    from_label = multi_match.group(2)
+                    rhs = multi_match.group(3)
+
+                    self._register_node(from_id, from_label, current_group)
+
+                    # Split RHS on '&' and parse each target
+                    for part in rhs.split('&'):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        node_match = re.match(r'(\w+)(?:\[([^\]]+)\])?', part)
+                        if not node_match:
+                            continue
+                        to_id = node_match.group(1)
+                        to_label = node_match.group(2)
+
+                        self._register_node(to_id, to_label, current_group)
+                        self.edges.append((from_id, to_id))
+
+                    continue
+
+            # 3) Standard single-target connection: A --> B or A[Label] --> B[Label]
             connection_match = re.search(
                 r'(\w+)(?:\[([^\]]+)\])?\s*-->\s*(\w+)(?:\[([^\]]+)\])?',
                 line
@@ -103,34 +210,28 @@ class MermaidParser:
                 to_id = connection_match.group(3)
                 to_label = connection_match.group(4)
 
-                # Only set label if we have one and node doesn't exist yet
-                # CRITICAL: Don't overwrite existing labels!
-                if from_label:
-                    self.nodes[from_id] = from_label
-                elif from_id not in self.nodes:
-                    self.nodes[from_id] = from_id
-
-                if to_label:
-                    self.nodes[to_id] = to_label
-                elif to_id not in self.nodes:
-                    self.nodes[to_id] = to_id
+                self._register_node(from_id, from_label, current_group)
+                self._register_node(to_id, to_label, current_group)
 
                 self.edges.append((from_id, to_id))
                 continue
 
-            # Standalone node definition: A[Label]
+            # 4) Standalone node definition: A[Label]
             node_match = re.search(r'(\w+)\[([^\]]+)\]', line)
             if node_match:
                 node_id = node_match.group(1)
                 label = node_match.group(2)
-                self.nodes[node_id] = label
+                self._register_node(node_id, label, current_group)
+                continue
+
+            # Anything else is ignored (styling, config lines, etc.)
 
         # Validate that we found something
         if not self.nodes:
             raise ValueError("No valid Mermaid nodes found in diagram. Check syntax.")
 
         # Debug output
-        print(f"Parsed nodes:")
+        print("Parsed nodes:")
         for node_id, label in self.nodes.items():
             print(f"  {node_id}: '{label}'")
         print(f"Parsed edges: {self.edges}")
@@ -141,15 +242,17 @@ class MermaidParser:
 class FlowLayoutEngine:
     """Layout nodes based on flow hierarchy"""
 
-    def __init__(self, nodes, edges, width, height):
+    def __init__(self, nodes, edges, width, height, groups=None):
         self.nodes = nodes
         self.edges = edges
         self.width = width
         self.height = height
         self.positions = {}
+        self.groups = groups or {}
 
     def calculate_levels(self):
         """Determine hierarchical levels using BFS"""
+        # Find root nodes (nodes with no incoming edges)
         incoming = defaultdict(int)
         outgoing = defaultdict(list)
 
@@ -209,11 +312,14 @@ class FlowLayoutEngine:
             if num_nodes == 0:
                 continue
 
+            # Cluster nodes by subgraph group within the level
+            nodes_at_level.sort(key=lambda nid: self.groups.get(nid, ""))
+
             # Vertical position based on level (top to bottom)
             if max_level == 0:
                 y_pos = self.height / 2
             else:
-                y_pos = A4_HEIGHT - MARGIN - (level / max_level) * usable_height
+                y_pos = self.height - MARGIN - (level / max_level) * usable_height
 
             # Horizontal distribution
             if num_nodes == 1:
@@ -296,7 +402,7 @@ class VisioGenerator:
         self.visio = None
         self.doc = None
         self.page = None
-        self.master_shapes = {}
+        self.master_shapes = {}  # Store master shapes by type
         self.stencil = None
         self.rectangle_master = None
 
@@ -305,60 +411,95 @@ class VisioGenerator:
         self.visio = win32com.client.Dispatch("Visio.Application")
         self.visio.Visible = True
 
-        # Create new document
+        # Create new document with Basic Diagram template
         self.doc = self.visio.Documents.Add("")
         self.page = self.doc.Pages.Item(1)
 
-        # Set page size to A4
-        self.page.PageSheet.CellsSRC(1, 0, 0).FormulaU = f"{A4_WIDTH} in"
-        self.page.PageSheet.CellsSRC(1, 0, 1).FormulaU = f"{A4_HEIGHT} in"
+        # Set page size to A4 (landscape)
+        self.page.PageSheet.CellsSRC(1, 0, 0).FormulaU = f"{A4_WIDTH} in"   # Width
+        self.page.PageSheet.CellsSRC(1, 0, 1).FormulaU = f"{A4_HEIGHT} in"  # Height
 
     def find_rectangle_master(self):
-        """Find a suitable rectangle master from Basic Shapes stencil"""
+        """
+        Find a suitable rectangle master from Basic Shapes stencil
+        """
         if self.rectangle_master:
             return self.rectangle_master
 
+        # Get the path to Basic Shapes stencil
+        # Try multiple methods to find it
         stencil_paths = [
-            "BASFLO_M.VSSX",  # Basic Flowchart Shapes
+            "BASFLO_M.VSSX",  # Basic Flowchart Shapes (includes Rectangle/Process)
             "BASIC_U.VSSX",   # Basic Shapes
             "BASFLO_U.VSSX",  # Basic Flowchart
         ]
 
         for stencil_name in stencil_paths:
             try:
-                basic_stencil = self.visio.Documents.OpenEx(stencil_name, 4)
-                self.stencil = basic_stencil
-                print(f"Opened stencil: {stencil_name}")
-                break
-            except:
+                stencil_path = os.path.join(
+                    os.path.dirname(self.visio.Path),
+                    stencil_name
+                )
+
+                # Try direct stencil name first
+                try:
+                    basic_stencil = self.visio.Documents.OpenEx(
+                        stencil_name,
+                        4  # visOpenRO (read-only)
+                    )
+                    self.stencil = basic_stencil
+                    print(f"Opened stencil: {stencil_name}")
+                    break
+                except:
+                    # Try with full path
+                    if os.path.exists(stencil_path):
+                        basic_stencil = self.visio.Documents.OpenEx(
+                            stencil_path,
+                            4  # visOpenRO (read-only)
+                        )
+                        self.stencil = basic_stencil
+                        print(f"Opened stencil: {stencil_path}")
+                        break
+            except Exception:
                 continue
 
         if not self.stencil:
             print("⚠ Could not open any stencil, will use DrawRectangle")
             return None
 
-        # Try to find rectangle shape
-        for name in ["Rectangle", "Process", "Box", "Square"]:
+        # Try various possible names for rectangle shape
+        rectangle_names = [
+            "Rectangle",
+            "Process",  # From flowchart stencil
+            "Box",
+            "Square",
+        ]
+
+        for name in rectangle_names:
             try:
                 master = self.stencil.Masters(name)
                 print(f"✓ Found rectangle master: {name}")
                 self.rectangle_master = master
                 return master
-            except:
+            except Exception:
                 continue
 
+        # If none found, use DrawRectangle as fallback
         print("⚠ No rectangle master found, will use DrawRectangle")
         return None
 
     def create_rectangle_shape(self, x, y):
-        """Create a rectangle shape at given position"""
+        """
+        Create a rectangle shape at given position
+        """
         if self.rectangle_master is None:
             self.find_rectangle_master()
 
         if self.rectangle_master:
+            # Use master to drop shape
             shape = self.page.Drop(self.rectangle_master, x, y)
         else:
-            # Draw rectangle directly
+            # Draw rectangle directly - coordinates are center point
             x1 = x - SHAPE_WIDTH / 2
             y1 = y - SHAPE_HEIGHT / 2
             x2 = x + SHAPE_WIDTH / 2
@@ -367,33 +508,38 @@ class VisioGenerator:
 
         return shape
 
+    # ===== Connection point helpers (VBA-faithful) =====
+
     def ensure_connection_section(self, shape):
-        """Ensure the ConnectionPts section exists locally on the shape"""
-        # Use parameter 1 to check LOCAL existence (not inherited)
+        """
+        Ensure the ConnectionPts section exists on the shape.
+        Uses local existence check (1), matching your VBA.
+        """
         if not shape.SectionExists(VIS_SECTION_CONNECTIONPTS, 1):
             shape.AddSection(VIS_SECTION_CONNECTIONPTS)
 
     def add_connection_points_shape(self, shape, connection_points, horizontal):
         """
-        Add connection points to one orientation (horizontal or vertical)
-        Faithful translation of VBA addConnectionPointsShape function
+        Direct translation of your addConnectionPointsShape VBA macro
+        for a single orientation.
 
-        :param shape: Visio Shape object
-        :param connection_points: Number of subdivisions along the side
-        :param horizontal: False = left/right edges (Y varies)
-                          True = top/bottom edges (X varies)
+        :param shape: Visio Shape COM object.
+        :param connection_points: number of subdivisions along the side.
+        :param horizontal: False = left/right edges (Y varies),
+                           True  = top/bottom edges (X varies).
         """
+        connection_points = int(connection_points)
         if connection_points <= 0:
             return
 
         self.ensure_connection_section(shape)
 
-        upper = int(connection_points)
+        upper = connection_points
         denom = 2 * upper
 
         for i in range(1, upper + 1):
-            for j in range(1, 3):  # Two opposite sides
-                # Add row and capture the index
+            for j in range(1, 2 + 1):  # 1..2 (two opposite sides)
+                # Capture the row index returned by AddRow
                 row = shape.AddRow(
                     VIS_SECTION_CONNECTIONPTS,
                     VIS_ROW_CONNECTIONPTS,
@@ -401,81 +547,106 @@ class VisioGenerator:
                 )
 
                 if not horizontal:
-                    # Vertical orientation: left/right edges
-                    y_formula = f"={i}*(Height/{upper})-Height/{denom}"
+                    # Vertical orientation: left/right edges, Y varies
+                    y_formula = f"={i}*(Height/{upper}) - Height/{denom}"
 
                     if j == 1:
-                        x_formula = "=Width*0"  # Left edge
+                        # Left edge
+                        x_formula = "=Width*0"
                     else:
-                        x_formula = "=Width*1"  # Right edge
+                        # Right edge
+                        x_formula = "=Width*1"
                 else:
-                    # Horizontal orientation: top/bottom edges
-                    x_formula = f"={i}*(Width/{upper})-Width/{denom}"
+                    # Horizontal orientation: top/bottom edges, X varies
+                    x_formula = f"={i}*(Width/{upper}) - Width/{denom}"
 
                     if j == 1:
-                        y_formula = "=Height*0"  # Bottom edge
+                        # Bottom edge
+                        y_formula = "=Height*0"
                     else:
-                        y_formula = "=Height*1"  # Top edge
+                        # Top edge
+                        y_formula = "=Height*1"
 
-                # Set formulas using the returned row index
-                shape.CellsSRC(VIS_SECTION_CONNECTIONPTS, row, VIS_CELL_X).FormulaU = x_formula
-                shape.CellsSRC(VIS_SECTION_CONNECTIONPTS, row, VIS_CELL_Y).FormulaU = y_formula
+                # Use FormulaU with universal cell names (Width/Height)
+                shape.CellsSRC(
+                    VIS_SECTION_CONNECTIONPTS,
+                    row,
+                    VIS_CELL_X
+                ).FormulaU = x_formula
+
+                shape.CellsSRC(
+                    VIS_SECTION_CONNECTIONPTS,
+                    row,
+                    VIS_CELL_Y
+                ).FormulaU = y_formula
 
     def add_connection_points(self, shape, horizontal_count, vertical_count):
         """
-        Add connection points to all four sides of a shape
+        Add connection points to a shape on all four sides, using the
+        same subdivision logic as your VBA utilities:
 
-        :param shape: Visio Shape object
-        :param horizontal_count: Connection points on top/bottom edges
-        :param vertical_count: Connection points on left/right edges
+        - vertical_count → left/right sides
+        - horizontal_count → bottom/top sides
         """
         if vertical_count > 0:
             self.add_connection_points_shape(shape, vertical_count, horizontal=False)
         if horizontal_count > 0:
             self.add_connection_points_shape(shape, horizontal_count, horizontal=True)
 
+    # ===== Master shape and shape creation =====
+
     def create_master_shape(self):
-        """Create a master shape with thicker border"""
+        """
+        Create a master shape with thicker border.
+        All other shapes of this type will reference this master for sizing.
+        """
         if "master" in self.master_shapes:
             return self.master_shapes["master"]
 
         # Place master shape in upper-left corner
         master_x = MARGIN + SHAPE_WIDTH / 2
-        master_y = A4_HEIGHT - MARGIN - SHAPE_HEIGHT / 2
+        master_y = self.page.PageSheet.Cells("PageHeight").ResultIU - MARGIN - SHAPE_HEIGHT / 2
 
         master_shape = self.create_rectangle_shape(master_x, master_y)
         master_shape.Text = "MASTER"
 
-        # Set size using FormulaForce to override guards
+        # Use FormulaForce to override any guards on the cells
         try:
             master_shape.Cells("Width").FormulaForce = f"{SHAPE_WIDTH} in"
             master_shape.Cells("Height").FormulaForce = f"{SHAPE_HEIGHT} in"
         except Exception as e:
             print(f"⚠ Warning: Could not set master shape size: {e}")
+            print("  Continuing with default size...")
 
-        # Make border thicker
+        # Make border thicker (LineWeight)
         try:
             master_shape.Cells("LineWeight").FormulaU = "3 pt"
-        except:
+        except Exception:
             pass
 
         # Add connection points to master
         self.add_connection_points(master_shape, self.horizontal_connections, self.vertical_connections)
 
+        # Store the master shape
         self.master_shapes["master"] = master_shape
+
         print(f"✓ Created master shape: {master_shape.Name} (ID: {master_shape.ID})")
 
         return master_shape
 
     def link_shape_to_master(self, shape, master_shape):
-        """Link a shape's dimensions to the master shape using GUARD formulas"""
+        """
+        Link a shape's width and height to the master shape using GUARD formulas
+        This replicates your SetMasterShape VBA function
+        """
         master_name = master_shape.Name
 
         try:
+            # Use GUARD to force the formulas and prevent manual override
             shape.Cells("Width").FormulaForce = f"GUARD({master_name}!Width)"
             shape.Cells("Height").FormulaForce = f"GUARD({master_name}!Height)"
         except Exception as e:
-            print(f"⚠ Warning: Could not link shape to master: {e}")
+            print(f"⚠ Warning: Could not link shape {shape.Text[:20]} to master: {e}")
 
     def create_shapes(self, nodes, positions):
         """Create Visio shapes at calculated positions"""
@@ -491,13 +662,15 @@ class VisioGenerator:
 
             # Create shape
             shape = self.create_rectangle_shape(x, y)
+
+            # Set text
             shape.Text = label
             print(f"Created shape '{node_id}' with label '{label}' at ({x:.2f}, {y:.2f})")
 
-            # Link to master shape for consistent sizing
+            # Link to master shape for sizing
             self.link_shape_to_master(shape, master_shape)
 
-            # Add connection points
+            # Add connection points (four sides)
             self.add_connection_points(shape, self.horizontal_connections, self.vertical_connections)
 
             shape_map[node_id] = shape
@@ -506,7 +679,7 @@ class VisioGenerator:
 
     def generate(self, mermaid_text):
         """Main generation function"""
-        # Parse Mermaid diagram
+        # Parse Mermaid
         parser = MermaidParser(mermaid_text)
         nodes, edges = parser.parse()
 
@@ -514,13 +687,13 @@ class VisioGenerator:
 
         # Calculate layout
         if self.layout_engine == 'flow':
-            layout = FlowLayoutEngine(nodes, edges, A4_WIDTH, A4_HEIGHT)
+            layout = FlowLayoutEngine(nodes, edges, A4_WIDTH, A4_HEIGHT, groups=parser.groups)
         else:
             layout = HilbertLayoutEngine(nodes, edges, A4_WIDTH, A4_HEIGHT)
 
         positions = layout.layout()
 
-        print(f"\nCalculated positions:")
+        print("\nCalculated positions:")
         for node_id, pos in positions.items():
             print(f"  {node_id}: {pos}")
 
@@ -528,7 +701,7 @@ class VisioGenerator:
         self.create_document()
 
         # Create shapes
-        print(f"\nCreating shapes...")
+        print("\nCreating shapes...")
         shapes = self.create_shapes(nodes, positions)
 
         print(f"\n✓ Created {len(shapes)} shapes in Visio")
@@ -599,24 +772,24 @@ Examples:
     # Input source (mutually exclusive)
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--file', '-f',
-                            help='Path to file containing Mermaid diagram')
+                             help='Path to file containing Mermaid diagram')
     input_group.add_argument('--clipboard', '-c', action='store_true',
-                            help='Read Mermaid diagram from clipboard')
+                             help='Read Mermaid diagram from clipboard')
 
     # Layout options
     parser.add_argument('--layout', '-l',
-                       choices=['flow', 'hilbert'],
-                       default='flow',
-                       help='Layout algorithm (default: flow)')
+                        choices=['flow', 'hilbert'],
+                        default='flow',
+                        help='Layout algorithm (default: flow)')
 
     # Connection point options
     parser.add_argument('--horizontal', type=int,
-                       default=DEFAULT_HORIZONTAL_CONNECTIONS,
-                       help=f'Number of horizontal connection points (default: {DEFAULT_HORIZONTAL_CONNECTIONS})')
+                        default=DEFAULT_HORIZONTAL_CONNECTIONS,
+                        help=f'Number of horizontal connection points (default: {DEFAULT_HORIZONTAL_CONNECTIONS})')
 
     parser.add_argument('--vertical', type=int,
-                       default=DEFAULT_VERTICAL_CONNECTIONS,
-                       help=f'Number of vertical connection points (default: {DEFAULT_VERTICAL_CONNECTIONS})')
+                        default=DEFAULT_VERTICAL_CONNECTIONS,
+                        help=f'Number of vertical connection points (default: {DEFAULT_VERTICAL_CONNECTIONS})')
 
     args = parser.parse_args()
 
@@ -635,8 +808,8 @@ Examples:
     else:
         mermaid_text = load_from_clipboard()
 
-    # Display configuration
-    print(f"\nConfiguration:")
+    # Display what we're doing
+    print("\nConfiguration:")
     print(f"  Layout engine: {args.layout}")
     print(f"  Horizontal connection points: {args.horizontal}")
     print(f"  Vertical connection points: {args.vertical}")
