@@ -21,6 +21,13 @@ import os
 from collections import defaultdict, deque
 import math
 
+# Visio constants
+VIS_SECTION_CONNECTIONPTS = 7      # visSectionConnectionPts
+VIS_ROW_CONNECTIONPTS = 0          # visRowConnectionPts
+VIS_TAG_CNNCTPT = 153              # visTagCnnctPt
+VIS_CELL_X = 0                     # Column index for X
+VIS_CELL_Y = 1                     # Column index for Y
+
 # A4 dimensions in inches (Visio uses inches)
 A4_WIDTH = 8.27
 A4_HEIGHT = 11.69
@@ -29,8 +36,6 @@ A4_HEIGHT = 11.69
 MARGIN = 0.5
 SHAPE_WIDTH = 1.5
 SHAPE_HEIGHT = 0.75
-HORIZONTAL_SPACING = 0.5
-VERTICAL_SPACING = 0.75
 
 # Connection point defaults
 DEFAULT_HORIZONTAL_CONNECTIONS = 5
@@ -57,14 +62,12 @@ class MermaidParser:
                 continue
 
             # Handle curly braces in node definitions (e.g., C{Authenticated?})
-            # Replace with square brackets for consistency
             line = re.sub(r'(\w+)\{([^}]+)\}', r'\1[\2]', line)
 
             # Handle different arrow types: -->, --->, -.->
-            # Normalize to -->
             line = re.sub(r'[-\.]{2,}>', '-->', line)
 
-            # Parse connection with labels on edges: A -->|label| B or A --|label|--> B
+            # Parse connection with labels on edges: A -->|label| B
             edge_label_match = re.search(
                 r'(\w+)(?:\[([^\]]+)\])?\s*-->\|([^\|]+)\|\s*(\w+)(?:\[([^\]]+)\])?',
                 line
@@ -72,12 +75,10 @@ class MermaidParser:
             if edge_label_match:
                 from_id = edge_label_match.group(1)
                 from_label = edge_label_match.group(2)
-                # edge_label = edge_label_match.group(3)  # Edge label (ignored)
                 to_id = edge_label_match.group(4)
                 to_label = edge_label_match.group(5)
 
                 # Only set label if we have one and node doesn't exist yet
-                # CRITICAL: Don't overwrite existing labels!
                 if from_label:
                     self.nodes[from_id] = from_label
                 elif from_id not in self.nodes:
@@ -149,7 +150,6 @@ class FlowLayoutEngine:
 
     def calculate_levels(self):
         """Determine hierarchical levels using BFS"""
-        # Find root nodes (nodes with no incoming edges)
         incoming = defaultdict(int)
         outgoing = defaultdict(list)
 
@@ -296,7 +296,7 @@ class VisioGenerator:
         self.visio = None
         self.doc = None
         self.page = None
-        self.master_shapes = {}  # Store master shapes by type
+        self.master_shapes = {}
         self.stencil = None
         self.rectangle_master = None
 
@@ -305,72 +305,40 @@ class VisioGenerator:
         self.visio = win32com.client.Dispatch("Visio.Application")
         self.visio.Visible = True
 
-        # Create new document with Basic Diagram template
+        # Create new document
         self.doc = self.visio.Documents.Add("")
         self.page = self.doc.Pages.Item(1)
 
         # Set page size to A4
-        self.page.PageSheet.CellsSRC(1, 0, 0).FormulaU = f"{A4_WIDTH} in"  # Width
-        self.page.PageSheet.CellsSRC(1, 0, 1).FormulaU = f"{A4_HEIGHT} in"  # Height
+        self.page.PageSheet.CellsSRC(1, 0, 0).FormulaU = f"{A4_WIDTH} in"
+        self.page.PageSheet.CellsSRC(1, 0, 1).FormulaU = f"{A4_HEIGHT} in"
 
     def find_rectangle_master(self):
-        """
-        Find a suitable rectangle master from Basic Shapes stencil
-        """
+        """Find a suitable rectangle master from Basic Shapes stencil"""
         if self.rectangle_master:
             return self.rectangle_master
 
-        # Get the path to Basic Shapes stencil
-        # Try multiple methods to find it
         stencil_paths = [
-            "BASFLO_M.VSSX",  # Basic Flowchart Shapes (includes Rectangle/Process)
+            "BASFLO_M.VSSX",  # Basic Flowchart Shapes
             "BASIC_U.VSSX",   # Basic Shapes
             "BASFLO_U.VSSX",  # Basic Flowchart
         ]
 
         for stencil_name in stencil_paths:
             try:
-                # Try to open the stencil
-                stencil_path = os.path.join(
-                    os.path.dirname(self.visio.Path),
-                    stencil_name
-                )
-
-                # Try direct stencil name first
-                try:
-                    basic_stencil = self.visio.Documents.OpenEx(
-                        stencil_name,
-                        4  # visOpenRO (read-only)
-                    )
-                    self.stencil = basic_stencil
-                    print(f"Opened stencil: {stencil_name}")
-                    break
-                except:
-                    # Try with full path
-                    if os.path.exists(stencil_path):
-                        basic_stencil = self.visio.Documents.OpenEx(
-                            stencil_path,
-                            4  # visOpenRO (read-only)
-                        )
-                        self.stencil = basic_stencil
-                        print(f"Opened stencil: {stencil_path}")
-                        break
-            except Exception as e:
+                basic_stencil = self.visio.Documents.OpenEx(stencil_name, 4)
+                self.stencil = basic_stencil
+                print(f"Opened stencil: {stencil_name}")
+                break
+            except:
                 continue
 
         if not self.stencil:
             print("⚠ Could not open any stencil, will use DrawRectangle")
             return None
 
-        # Try various possible names for rectangle shape
-        rectangle_names = [
-            "Rectangle",
-            "Process",  # From flowchart stencil
-            "Box",
-            "Square",
-        ]
-
-        for name in rectangle_names:
+        # Try to find rectangle shape
+        for name in ["Rectangle", "Process", "Box", "Square"]:
             try:
                 master = self.stencil.Masters(name)
                 print(f"✓ Found rectangle master: {name}")
@@ -379,22 +347,18 @@ class VisioGenerator:
             except:
                 continue
 
-        # If none found, use DrawRectangle as fallback
         print("⚠ No rectangle master found, will use DrawRectangle")
         return None
 
     def create_rectangle_shape(self, x, y):
-        """
-        Create a rectangle shape at given position
-        """
+        """Create a rectangle shape at given position"""
         if self.rectangle_master is None:
             self.find_rectangle_master()
 
         if self.rectangle_master:
-            # Use master to drop shape
             shape = self.page.Drop(self.rectangle_master, x, y)
         else:
-            # Draw rectangle directly - coordinates are center point
+            # Draw rectangle directly
             x1 = x - SHAPE_WIDTH / 2
             y1 = y - SHAPE_HEIGHT / 2
             x2 = x + SHAPE_WIDTH / 2
@@ -403,49 +367,75 @@ class VisioGenerator:
 
         return shape
 
+    def ensure_connection_section(self, shape):
+        """Ensure the ConnectionPts section exists locally on the shape"""
+        # Use parameter 1 to check LOCAL existence (not inherited)
+        if not shape.SectionExists(VIS_SECTION_CONNECTIONPTS, 1):
+            shape.AddSection(VIS_SECTION_CONNECTIONPTS)
+
+    def add_connection_points_shape(self, shape, connection_points, horizontal):
+        """
+        Add connection points to one orientation (horizontal or vertical)
+        Faithful translation of VBA addConnectionPointsShape function
+
+        :param shape: Visio Shape object
+        :param connection_points: Number of subdivisions along the side
+        :param horizontal: False = left/right edges (Y varies)
+                          True = top/bottom edges (X varies)
+        """
+        if connection_points <= 0:
+            return
+
+        self.ensure_connection_section(shape)
+
+        upper = int(connection_points)
+        denom = 2 * upper
+
+        for i in range(1, upper + 1):
+            for j in range(1, 3):  # Two opposite sides
+                # Add row and capture the index
+                row = shape.AddRow(
+                    VIS_SECTION_CONNECTIONPTS,
+                    VIS_ROW_CONNECTIONPTS,
+                    VIS_TAG_CNNCTPT
+                )
+
+                if not horizontal:
+                    # Vertical orientation: left/right edges
+                    y_formula = f"={i}*(Height/{upper})-Height/{denom}"
+
+                    if j == 1:
+                        x_formula = "=Width*0"  # Left edge
+                    else:
+                        x_formula = "=Width*1"  # Right edge
+                else:
+                    # Horizontal orientation: top/bottom edges
+                    x_formula = f"={i}*(Width/{upper})-Width/{denom}"
+
+                    if j == 1:
+                        y_formula = "=Height*0"  # Bottom edge
+                    else:
+                        y_formula = "=Height*1"  # Top edge
+
+                # Set formulas using the returned row index
+                shape.CellsSRC(VIS_SECTION_CONNECTIONPTS, row, VIS_CELL_X).FormulaU = x_formula
+                shape.CellsSRC(VIS_SECTION_CONNECTIONPTS, row, VIS_CELL_Y).FormulaU = y_formula
+
     def add_connection_points(self, shape, horizontal_count, vertical_count):
         """
-        Add connection points to a shape
-        Based on your VBA code - adds points on all four sides
+        Add connection points to all four sides of a shape
+
+        :param shape: Visio Shape object
+        :param horizontal_count: Connection points on top/bottom edges
+        :param vertical_count: Connection points on left/right edges
         """
-        # Section and row constants
-        visSectionConnectionPts = 9
-        visRowConnectionPts = 0
-        visTagCnnctPt = 153
-
-        # Cell indices
-        visX = 0
-        visY = 1
-
-        # CRITICAL: Check if section exists LOCALLY (parameter 1, not 0)
-        # This is what your VBA does!
-        if not shape.SectionExists(visSectionConnectionPts, 1):
-            shape.AddSection(visSectionConnectionPts)
-
-        # Add vertical connection points (left and right sides)
-        for i in range(1, vertical_count + 1):
-            for side in [0, 1]:  # 0 = left, 1 = right
-                row_num = shape.AddRow(visSectionConnectionPts, visRowConnectionPts, visTagCnnctPt)
-
-                # Use the returned row_num to set formulas
-                shape.CellsSRC(visSectionConnectionPts, row_num, visX).Formula = f"=Width*{side}"
-                shape.CellsSRC(visSectionConnectionPts, row_num, visY).Formula = \
-                    f"={i}*(Height/{vertical_count})-Height/{2 * vertical_count}"
-
-        # Add horizontal connection points (top and bottom sides)
-        for i in range(1, horizontal_count + 1):
-            for side in [0, 1]:  # 0 = bottom, 1 = top
-                row_num = shape.AddRow(visSectionConnectionPts, visRowConnectionPts, visTagCnnctPt)
-
-                shape.CellsSRC(visSectionConnectionPts, row_num, visY).Formula = f"=Height*{side}"
-                shape.CellsSRC(visSectionConnectionPts, row_num, visX).Formula = \
-                    f"={i}*(Width/{horizontal_count})-Width/{2 * horizontal_count}"
+        if vertical_count > 0:
+            self.add_connection_points_shape(shape, vertical_count, horizontal=False)
+        if horizontal_count > 0:
+            self.add_connection_points_shape(shape, horizontal_count, horizontal=True)
 
     def create_master_shape(self):
-        """
-        Create a master shape with thicker border
-        All other shapes of this type will reference this master for sizing
-        """
+        """Create a master shape with thicker border"""
         if "master" in self.master_shapes:
             return self.master_shapes["master"]
 
@@ -456,15 +446,14 @@ class VisioGenerator:
         master_shape = self.create_rectangle_shape(master_x, master_y)
         master_shape.Text = "MASTER"
 
-        # Use FormulaForce to override any guards on the cells
+        # Set size using FormulaForce to override guards
         try:
             master_shape.Cells("Width").FormulaForce = f"{SHAPE_WIDTH} in"
             master_shape.Cells("Height").FormulaForce = f"{SHAPE_HEIGHT} in"
         except Exception as e:
             print(f"⚠ Warning: Could not set master shape size: {e}")
-            print("  Continuing with default size...")
 
-        # Make border thicker (LineWeight)
+        # Make border thicker
         try:
             master_shape.Cells("LineWeight").FormulaU = "3 pt"
         except:
@@ -473,26 +462,20 @@ class VisioGenerator:
         # Add connection points to master
         self.add_connection_points(master_shape, self.horizontal_connections, self.vertical_connections)
 
-        # Store the master shape
         self.master_shapes["master"] = master_shape
-
         print(f"✓ Created master shape: {master_shape.Name} (ID: {master_shape.ID})")
 
         return master_shape
 
     def link_shape_to_master(self, shape, master_shape):
-        """
-        Link a shape's width and height to the master shape using GUARD formulas
-        This replicates your SetMasterShape VBA function
-        """
+        """Link a shape's dimensions to the master shape using GUARD formulas"""
         master_name = master_shape.Name
 
         try:
-            # Use GUARD to force the formulas and prevent manual override
             shape.Cells("Width").FormulaForce = f"GUARD({master_name}!Width)"
             shape.Cells("Height").FormulaForce = f"GUARD({master_name}!Height)"
         except Exception as e:
-            print(f"⚠ Warning: Could not link shape {shape.Text[:20]} to master: {e}")
+            print(f"⚠ Warning: Could not link shape to master: {e}")
 
     def create_shapes(self, nodes, positions):
         """Create Visio shapes at calculated positions"""
@@ -508,12 +491,10 @@ class VisioGenerator:
 
             # Create shape
             shape = self.create_rectangle_shape(x, y)
-
-            # Set text - this is critical!
             shape.Text = label
             print(f"Created shape '{node_id}' with label '{label}' at ({x:.2f}, {y:.2f})")
 
-            # Link to master shape for sizing
+            # Link to master shape for consistent sizing
             self.link_shape_to_master(shape, master_shape)
 
             # Add connection points
@@ -525,7 +506,7 @@ class VisioGenerator:
 
     def generate(self, mermaid_text):
         """Main generation function"""
-        # Parse Mermaid
+        # Parse Mermaid diagram
         parser = MermaidParser(mermaid_text)
         nodes, edges = parser.parse()
 
@@ -654,7 +635,7 @@ Examples:
     else:
         mermaid_text = load_from_clipboard()
 
-    # Display what we're doing
+    # Display configuration
     print(f"\nConfiguration:")
     print(f"  Layout engine: {args.layout}")
     print(f"  Horizontal connection points: {args.horizontal}")
