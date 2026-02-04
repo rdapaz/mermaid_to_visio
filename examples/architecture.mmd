@@ -1,0 +1,9 @@
+graph TD
+    A[Client Application] --> B[Load Balancer]
+    B --> C[Web Server 1]
+    B --> D[Web Server 2]
+    C --> E[Database Primary]
+    D --> E
+    E --> F[Database Replica]
+    B --> G[Cache Server]
+    G --> E

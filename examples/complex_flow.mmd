@@ -1,0 +1,10 @@
+graph TD
+    A[User Request] --> B[Authentication]
+    B --> C{Authenticated?}
+    C -->|Yes| D[Load Data]
+    C -->|No| E[Login Page]
+    E --> B
+    D --> F[Process Request]
+    F --> G[Generate Response]
+    G --> H[Cache Result]
+    H --> I[Return to User]
